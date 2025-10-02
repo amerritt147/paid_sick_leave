@@ -15,14 +15,14 @@ import numpy as np
 import geopandas as gpd
 from sklearn.model_selection import train_test_split
 from sklearn import metrics
-from sklearn.utils import resample
+#from sklearn.utils import resample
 from sklearn.metrics import roc_auc_score
 import statsmodels.formula.api as smf
 import statsmodels.api as sm
 import us
 import matplotlib as mpl
 from mpl_toolkits.axes_grid1 import make_axes_locatable
-
+from sklearn.metrics import roc_auc_score, confusion_matrix
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -146,7 +146,6 @@ crosswalk['county']= crosswalk['county'].astype(str).str.zfill(5)
 ########################################################################################################################################################################################################
 ############################################################################################ Model Creation ###########################################################################################
 ########################################################################################################################################################################################################
-
 def model_selection(yr,bases,family_income_vs_education,race='no',save_line='base_23'):
     
     # Load cleaned NHIS data for the specified year
@@ -184,52 +183,6 @@ def model_selection(yr,bases,family_income_vs_education,race='no',save_line='bas
     X_train = X_train.copy()
     X_train["target"] = y_train
 
-    # # -------------------------
-    # # 2. Rebuild training dataframe
-    # # -------------------------
-    # df_train = X_train.copy()
-    # df_train['target'] = y_train
-    
-    # # -------------------------
-    # # 3. Separate majority and minority classes
-    # # -------------------------
-    # unrelated = df_train[df_train['full_time'] == 'Full-time']
-    # majority  = df_train[(df_train['full_time'] == 'Part-time') & (df_train['target'] == 0)]
-    # minority  = df_train[(df_train['full_time'] == 'Part-time') & (df_train['target'] == 1)]
-    
-    # target_size = len(majority)
-    
-    # # -------------------------
-    # # 4. Upsample minority class
-    # # -------------------------
-    # minority = minority.copy()
-    # minority['orig_index'] = minority.index  # assign before resampling
-    
-    # minority_upsampled = resample(
-    #     minority,
-    #     replace=True,
-    #     n_samples=target_size,
-    #     random_state=42
-    # )
-    
-    # # -------------------------
-    # # 5. Count repetitions & adjust weights
-    # # -------------------------
-    # reps = minority_upsampled.groupby('orig_index').size().to_dict()
-    
-    # minority_upsampled['weight'] = minority_upsampled.apply(
-    #     lambda row: row['weight'] / reps[row['orig_index']], axis=1
-    # )
-    
-    # minority_upsampled = minority_upsampled.drop(columns=['orig_index','target'])
-    
-    # # -------------------------
-    # # 6. Combine majority + upsampled minority
-    # # -------------------------
-    # df_balanced = pd.concat([majority, minority_upsampled, unrelated]).reset_index(drop=True)
-    # df=df_balanced
-    # print(df.columns)
-
     # Create formula for logistic regression with categorical variables
     formula = (
     'target ~ C(sex, Treatment(reference="' + bases['sex'] + '")) + '
@@ -240,7 +193,7 @@ def model_selection(yr,bases,family_income_vs_education,race='no',save_line='bas
     'poly(age, 2) + '
    # 'C(industry, Treatment(reference="' + bases['industry'] + '")) + '
     'C(occupation, Treatment(reference="' + bases['occupation'] + '")) + '
-    'C('+family_income_vs_education+', Treatment(reference="' + bases[family_income_vs_education] + '"))')
+    'C('+family_income_vs_education+', Treatment(reference="' + bases[family_income_vs_education] + '"))+ 1')
     
     
     # Add race to the formula if applicable
@@ -392,79 +345,84 @@ def model_selection(yr,bases,family_income_vs_education,race='no',save_line='bas
     
 
     ################################# Identify Threshold ###########################
-    
-    
-    # Generate probability predictions for the positive class (class 1) on test data
     test_df = X_test.copy()
     test_df['target'] = y_test
     
-    # Now use model.predict on test_df
+    # ⚠️ If using sklearn: y_probs = model.predict_proba(X_test)[:,1]
+    # ⚠️ If using statsmodels: y_probs = model.predict(X_test)
     y_probs = model.predict(test_df)
     test_df['predicted_prob'] = y_probs
-  
-    # Define threshold values from 0 to 1 with 0.001 step size
-    thresholds=list(np.arange(0,1,0.0001))
-    recall=[]
-    specificity=[]
-    # Create DataFrame to store threshold metrics
-    df_thresholding=pd.DataFrame(columns=['Threshold','Recall','Specificity','Difference'])
     
-    # Iterate through each threshold value
-    for i in thresholds:
-      # Convert probabilities to binary predictions using threshold
-      y_pred_custom = (y_probs >= i).astype(int)
+    # 2. Compute threshold metrics for PT & FT
+    thresholds = np.arange(0, 1, 0.001)
+    results = {}
+    optimal_thresholds = {}
     
-      # Calculate true negatives, false positives, false negatives, true positives
-      tn, fp, fn, tp = metrics.confusion_matrix(y_test, y_pred_custom).ravel()
+    for group in ['Part-time', 'Full-time']:
+        group_df = test_df[test_df['full_time'] == group]
+        y_true_group = group_df['target']
+        y_probs_group = group_df['predicted_prob']
     
-      # Calculate recall (sensitivity) and specificity, handling division by zero
-      recall_threshold = tp / (tp + fn) if (tp + fn) > 0 else 0
-      specificity_threshold = tn / (tn + fp) if (tn + fp) > 0 else 0
+        df_thr = pd.DataFrame(columns=['Threshold', 'Recall', 'Specificity', 'Difference'])
     
-      # Store metrics in DataFrame
-      df_thresholding.loc[len(df_thresholding)] = [i,recall_threshold,specificity_threshold,abs(recall_threshold-specificity_threshold)]
-      
-      # Append metrics to lists for plotting
-      recall.append(recall_threshold)
-      specificity.append(specificity_threshold)
-   
+        for thr in thresholds:
+            y_pred_custom = (y_probs_group >= thr).astype(int)
+            tn, fp, fn, tp = confusion_matrix(y_true_group, y_pred_custom).ravel()
     
-   
-    ########################## Plot Recall and Specificty ###########################
+            recall_thr = tp / (tp + fn) if (tp + fn) > 0 else 0
+            specificity_thr = tn / (tn + fp) if (tn + fp) > 0 else 0
     
+            df_thr.loc[len(df_thr)] = [
+                thr, recall_thr, specificity_thr, abs(recall_thr - specificity_thr)
+            ]
     
+        # Save DataFrame + best threshold
+        results[group] = df_thr
+        optimal_thresholds[group] = df_thr.loc[df_thr['Difference'].idxmin(), 'Threshold']
+    
+    # 3. Plot Recall & Specificity for both groups
     plt.figure(figsize=(10, 6))
-    plt.plot(df_thresholding['Threshold'], df_thresholding['Recall'], label='Recall (Sensitivity)', color='blue')
-    plt.plot(df_thresholding['Threshold'], df_thresholding['Specificity'], label='Specificity', color='green')
     
-    # Find point where recall and specificity are closest
-    min_diff_idx = df_thresholding['Difference'].idxmin()
-    intersection_threshold = df_thresholding.loc[min_diff_idx, 'Threshold']
-    intersection_recall = df_thresholding.loc[min_diff_idx, 'Recall']
-    intersection_specificity = df_thresholding.loc[min_diff_idx, 'Specificity']
+    colors = {
+        'Part-time': {'recall': 'green', 'specificity': 'green', 'point': 'green'},
+        'Full-time': {'recall': 'orange', 'specificity': 'orange', 'point': 'orange'}
+    }
     
-    # Highlight intersection
-    plt.scatter(intersection_threshold, intersection_recall, color='Black', zorder=5, label='Closest Intersection')
-    plt.axvline(intersection_threshold, color='Black', linestyle='--', linewidth=1)
+    for group in ['Part-time', 'Full-time']:
+        df_thr = results[group]
+        best_thr = optimal_thresholds[group]
+        best_row = df_thr.loc[df_thr['Difference'].idxmin()]
     
-    # Annotate
-    plt.annotate(f'Intersection\nThreshold: {intersection_threshold:.2f}',
-                 xy=(intersection_threshold, intersection_recall),
-                 xytext=(intersection_threshold + 0.02, intersection_recall - 0.1),
-                 arrowprops=dict(facecolor='black', arrowstyle='->'))
+        # Plot Recall & Specificity curves
+        plt.plot(df_thr['Threshold'], df_thr['Recall'],
+                 label=f'{group} Recall', color=colors[group]['recall'], linestyle='-.')
+        plt.plot(df_thr['Threshold'], df_thr['Specificity'],
+                 label=f'{group} Specificity', color=colors[group]['specificity'], linestyle='--')
+    
+        # Mark optimal threshold
+        plt.scatter(best_thr, best_row['Recall'], color=colors[group]['point'],
+                    zorder=5, label=f'{group} Optimal Threshold')
+        plt.axvline(best_thr, color=colors[group]['point'], linestyle='--', linewidth=1)
+    
+        # Annotate with threshold value
+        plt.annotate(f'{group}\nThr: {best_thr:.2f}',
+                     xy=(best_thr, best_row['Recall']),
+                     xytext=(best_thr + 0.02, best_row['Recall'] - 0.1),
+                     arrowprops=dict(facecolor=colors[group]['point'], arrowstyle='->'))
     
     # Labels and legend
     plt.xlabel('Threshold')
     plt.ylabel('Score')
-    plt.title('Recall and Specificity vs. Threshold')
+    plt.title('Recall and Specificity vs. Threshold (Part-time vs Full-time)')
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    if race=='no':
-        
+    
+    if race == 'no':
         plt.savefig('Paid_Leave/Regression_and_outputs/recall_specificity_'+save_line+'.png')
     else:
         plt.savefig('Paid_Leave/Regression_and_outputs/recall_specificity_with_race_'+save_line+'.png')
+    
     plt.show()
      
     
@@ -472,14 +430,14 @@ def model_selection(yr,bases,family_income_vs_education,race='no',save_line='bas
    
     ####################### PRINTING STATS ####################################
     
-    # Find threshold where difference between recall and specificity is minimum
-    ideal_threshold=df_thresholding.loc[df_thresholding['Difference'].idxmin(),'Threshold']
-    print('Ideal threshold is: ',str(ideal_threshold))
+    # # Find threshold where difference between recall and specificity is minimum
+    # ideal_threshold=df_thresholding.loc[df_thresholding['Difference'].idxmin(),'Threshold']
+    # print('Ideal threshold is: ',str(ideal_threshold))
     
-    y_pred = (y_probs >= ideal_threshold).astype(int)
+    # y_pred = (y_probs >= ideal_threshold).astype(int)
     
-    score = roc_auc_score(y_test, y_pred)
-    print('ROC AUC SCORE:' +str(score))
+    # score = roc_auc_score(y_test, y_pred)
+    # print('ROC AUC SCORE:' +str(score))
     
     # ################################## AGE EFFECT PLOT ##############################
 
@@ -512,25 +470,41 @@ def model_selection(yr,bases,family_income_vs_education,race='no',save_line='bas
     
    
     ########################## CONFUSION MATRIX ################################    
-    cnf_matrix = metrics.confusion_matrix(y_test, y_pred)
-    cnf_matrix
-    class_names=[0,1] # name  of classes
-    fig, ax = plt.subplots()
-    tick_marks = np.arange(len(class_names))
-    plt.xticks(tick_marks, class_names)
-    plt.yticks(tick_marks, class_names)
-    # create heatmap
-    sns.heatmap(pd.DataFrame(cnf_matrix), annot=True, cmap="YlGnBu" ,fmt='g')
-    ax.xaxis.set_label_position("bottom")
-    plt.tight_layout()
-    plt.title('Confusion matrix, Threshold: '+str(ideal_threshold), y=1.1)
-    plt.ylabel('Actual label')
-    plt.xlabel('Predicted label')
-    if race=='no':    
-        plt.savefig('Paid_Leave/Regression_and_outputs/confusion_matrix_'+save_line+'.png')
-    else:
-        plt.savefig('Paid_Leave/Regression_and_outputs/confusion_matrix_with_race_'+save_line+'.png')
-    return model,ideal_threshold, coef_df,summary_df
+    for group in ['Part-time', 'Full-time']:
+        group_df = test_df[test_df['full_time'] == group]
+        y_true_group = group_df['target']
+        y_probs_group = group_df['predicted_prob']
+    
+        # Use group-specific threshold
+        ideal_threshold = optimal_thresholds[group]
+        y_pred = (y_probs_group >= ideal_threshold).astype(int)
+    
+        # Confusion matrix
+        cnf_matrix = metrics.confusion_matrix(y_true_group, y_pred)
+        class_names = [0,1]
+    
+        fig, ax = plt.subplots(figsize=(6,5))
+        tick_marks = np.arange(len(class_names))
+        plt.xticks(tick_marks, class_names)
+        plt.yticks(tick_marks, class_names)
+    
+        # Heatmap
+        sns.heatmap(pd.DataFrame(cnf_matrix), annot=True, cmap="YlGnBu", fmt='g')
+        ax.xaxis.set_label_position("bottom")
+    
+        plt.title(f'{group} Confusion Matrix\nThreshold: {ideal_threshold:.3f}', y=1.1)
+        plt.ylabel('Actual label')
+        plt.xlabel('Predicted label')
+    
+        # Save file separately for each group
+        if race == 'no':
+            plt.savefig(f'Paid_Leave/Regression_and_outputs/confusion_matrix_{group}_{save_line}.png')
+        else:
+            plt.savefig(f'Paid_Leave/Regression_and_outputs/confusion_matrix_{group}_with_race_{save_line}.png')
+    
+        plt.show()
+
+    return model,optimal_thresholds['Part-time'],optimal_thresholds['Full-time'], coef_df,summary_df
 
 
 
@@ -538,7 +512,7 @@ def model_selection(yr,bases,family_income_vs_education,race='no',save_line='bas
 ############################################################################################ Model Usage ###############################################################################################
 ########################################################################################################################################################################################################
 
-def model_run(year,logreg,ideal_threshold,family_income_vs_education,race='no',save_line='base_22'):
+def model_run(year,logreg,pt_threshold,ft_threshold,family_income_vs_education,race='no',save_line='base_22'):
 
     #Importing Census Data for those employed
     file_name = 'Paid_Leave/cleaned_data/IPUMS/ipums_employed_'+str(year)+'_cleaned.csv'
@@ -580,12 +554,12 @@ def model_run(year,logreg,ideal_threshold,family_income_vs_education,race='no',s
         
         
         results['Probability']=pums_probs
-        results['Prediction']=(results['Probability'] >= ideal_threshold).astype(int)
-
+        results['Prediction']=np.nan
+        results['Prediction'].loc[results['full_time']=='Part-time']=(results['Probability'].loc[results['full_time']=='Part-time'] >= pt_threshold).astype(int)
+        results['Prediction'].loc[results['full_time']=='Full-time']=(results['Probability'].loc[results['full_time']=='Full-time'] >= ft_threshold).astype(int)
         results['SAH']=np.nan
         results['SAH'].loc[results['Prediction']==1]=1
         results['SAH'].loc[results['Prediction']==0]=0
-        #results = pd.DataFrame({'PUMA': puma_col,'STATEFIP':state,'PERWT':person_weight, 'Prediction': pums_pred_series})
         all_results.append(results)
     
    
@@ -594,7 +568,7 @@ def model_run(year,logreg,ideal_threshold,family_income_vs_education,race='no',s
     
     #Importing unemployed dataset 
     unemployed=pd.read_csv('Paid_Leave/cleaned_data/IPUMS/ipums_notemployed_'+str(year)+'_cleaned.csv')
-   #All inemployed would not have paid leave, but would be safe at home 
+    #All inemployed would not have paid leave, but would be safe at home 
     unemployed['Prediction']=0
     unemployed['SAH']=1
     
@@ -616,32 +590,32 @@ def puma_crosswalk(df, crosswalk, race='no', save_line='base_23'):
 
     outcomes = {}  # store results for each variable
 
-    for var in ["Prediction", "SAH"]:
+    for var in ["Prediction"]:
         # Weighted variable at person level
-        df[f"individual_{var}_pums"] = df[var] * df["PERWT"]
+        df["individual_Prediction_pums"] = df[var] * df["PERWT"]
 
         # Aggregate to PUMA level
         df_sums = (
-            df.groupby(["PUMA", "STATEFIP"])[[f"individual_{var}_pums", "PERWT"]]
+            df.groupby(["PUMA", "STATEFIP"])[["individual_Prediction_pums", "PERWT"]]
             .sum()
             .reset_index()
         )
-        df_sums[f"individual_{var}_prop"] = df_sums[f"individual_{var}_pums"] / df_sums["PERWT"]
+        df_sums["individual_Prediction_prop"] = df_sums["individual_Prediction_pums"] / df_sums["PERWT"]
 
         # Merge with crosswalk
         merged = pd.merge(crosswalk, df_sums, on=["PUMA", "STATEFIP"], how="left")
 
         # Ensure numerics
-        for col in [f"individual_{var}_prop", "prop_county_in_puma", "pop20"]:
+        for col in ["individual_Prediction_prop", "prop_county_in_puma", "pop20"]:
             merged[col] = pd.to_numeric(merged[col], errors="coerce")
 
         # Scale to counties
-        merged[f"weighted_{var}"] = merged[f"individual_{var}_prop"] * merged["prop_county_in_puma"]
-        merged[f"PERWT_{var}"] = merged["PERWT"] * merged["prop_county_in_puma"]
+        merged["weighted_Prediction"] = merged["individual_Prediction_prop"] * merged["prop_county_in_puma"]
+        merged["PERWT_Prediction"] = merged["PERWT"] * merged["prop_county_in_puma"]
 
         # Aggregate to county level
         df_outcomes = (
-            merged.groupby("county")[[f"weighted_{var}", f"PERWT_{var}", "pop20", "prop_county_in_puma"]]
+            merged.groupby("county")[["weighted_Prediction", "PERWT_Prediction", "pop20", "prop_county_in_puma"]]
             .sum()
             .reset_index()
         )
@@ -650,8 +624,8 @@ def puma_crosswalk(df, crosswalk, race='no', save_line='base_23'):
         df_outcomes = df_outcomes.merge(county_pops, on="county", how="left")
 
         # Final props & counts
-        df_outcomes[f"proportions_{var}"] = df_outcomes[f"weighted_{var}"] / df_outcomes["prop_county_in_puma"]
-        df_outcomes[f"counts_{var}"] = df_outcomes[f"proportions_{var}"] * df_outcomes["pop20"]
+        df_outcomes["proportions_Prediction"] = df_outcomes["weighted_Prediction"] / df_outcomes["prop_county_in_puma"]
+        df_outcomes["counts_Prediction"] = df_outcomes["proportions_Prediction"] * df_outcomes["pop20"]
 
         # Store results
         outcomes[var] = (df_outcomes, df_sums, merged)
@@ -665,15 +639,13 @@ def puma_crosswalk(df, crosswalk, race='no', save_line='base_23'):
     df_outcomes_pred["Census_Division"] = df_outcomes_pred["State"].map(state_to_division)
 
     # --- SAH ---
-    df_outcomes_sah, _, _ = outcomes["SAH"]
 
     # Merge them together
-    df_outcomes_combined = df_outcomes_pred.merge(df_outcomes_sah, on="county", how="left")
+    df_outcomes_combined = df_outcomes_pred
     df_outcomes_combined.rename(columns={'proportions_Prediction':'proportions'},inplace=True)
     # Save
     df_outcomes_combined.to_csv(
-        f"Paid_leave/Regression_and_outputs/Counties_outcomes_with_race_{save_line}.csv", index=False
-    )
+        f"Paid_leave/Regression_and_outputs/Counties_outcomes_with_race_{save_line}.csv", index=False)
 
     return df_outcomes_combined, df_sums_pred, merged_pred
 
@@ -710,13 +682,12 @@ def mapping(df, column_name, county_column_name,family_income_vs_education,race=
     highlight_states = states_gdf[states_gdf['NAME'].isin(states_of_interest)]  # or use FIPS: states_gdf[states_gdf['STATEFP'].isin(['51', '24', '37'])]
     norm = mpl.colors.Normalize(vmin=0, vmax=1)
     # Plot counties
-    plot = continental.plot(
+    continental.plot(
         column=column_name,
         ax=ax,
         cmap='GnBu',
         linewidth=0.1,
-        edgecolor='0.5',norm=norm
-    )
+        edgecolor='0.5',norm=norm)
     
     # Plot state borders for selected states
     highlight_states.boundary.plot(ax=ax, color='black', linewidth=1)
@@ -774,7 +745,7 @@ def mapping(df, column_name, county_column_name,family_income_vs_education,race=
     
     
     if race==True:
-        df_no_race=pd.read_csv('Paid_leave/Regression_and_outputs/Counties_outcomes_base_22.csv')
+        df_no_race=pd.read_csv('Paid_leave/Regression_and_outputs/Counties_outcomes_base_23.csv')
         df_no_race['county'] = df_no_race['county'].astype(str).str.zfill(5)
         df_no_race=df_no_race.rename(columns={'proportions':'proportions_no_race'})
         race_diff=continental.merge(df_no_race[['county','proportions_no_race']],how='outer',on='county')
@@ -783,12 +754,11 @@ def mapping(df, column_name, county_column_name,family_income_vs_education,race=
         fig, ax = plt.subplots(1, 1, figsize=(16, 12))
 
         # Plot the counties
-        plot = race_diff.plot(
+        race_diff.plot(
             column='race_diff',
             ax=ax,
             cmap='PRGn',
-            linewidth=0.1
-        )
+            linewidth=0.1)
 
         ax.set_title("County-Level Difference in Paid Leave w/ Race Covariates", fontsize=20)
         ax.axis('off')
@@ -806,79 +776,8 @@ def mapping(df, column_name, county_column_name,family_income_vs_education,race=
         cbar = fig.colorbar(sm, cax=cax, orientation='horizontal')
         cbar.set_label("Base Model - Model w/ Race Covariate ", fontsize=12)
         plt.show()
-###############################################################################
-def summarize_demographics(df, df_map, demographic_columns, label_map=None):
-    summaries = []
 
-    # ---------- National Summary ----------
-    national = (df_map['proportions_18+'] * df_map['AGE18PLUS_TOT']).sum() / df_map['AGE18PLUS_TOT'].sum()
-    national_df = pd.DataFrame({'Demographic': ['National'], 'Adults (Survey)': [national]})
-    summaries.append(national_df)
 
-    # ---------- State Summary ----------
-    state = df_map.groupby('State', group_keys=False).apply(
-        lambda x: (
-            (x['proportions_18+'] * x['AGE18PLUS_TOT']).sum() / x['AGE18PLUS_TOT'].sum()
-            if x['AGE18PLUS_TOT'].sum() != 0 and not pd.isna(x['AGE18PLUS_TOT'].sum())
-            else np.nan
-        ),
-        include_groups=False
-    )
-    state = state.rename_axis('Demographic').reset_index(name='value')
-    summaries.append(state)
-
-    # ---------- Region Summary ----------
-    region = df_map.groupby('Census_Division', group_keys=False).apply(
-        lambda x: (
-            (x['proportions_18+'] * x['AGE18PLUS_TOT']).sum() / x['AGE18PLUS_TOT'].sum()
-            if x['AGE18PLUS_TOT'].sum() != 0 and not pd.isna(x['AGE18PLUS_TOT'].sum())
-            else np.nan
-        ),
-        include_groups=False
-        )
-    region = region.rename_axis('Demographic').reset_index(name='value')
-    summaries.append(region)
-
-    # ---------- Demographic-specific summaries ----------
-    for group_col in demographic_columns:
-        # Adults
-        df_adults = df.groupby(group_col)[['individual_prediction_pums', 'PERWT']].sum().reset_index()
-        df_adults['Adults (Survey)'] = df_adults['individual_prediction_pums'] / df_adults['PERWT']
-        df_adults['Demographic'] = df_adults[group_col]
-
-        # Optional label mapping
-        if group_col == 'STATEFIP' and label_map:
-            df_adults['Demographic'] = df_adults['Demographic'].map(label_map)
-
-        # Employed Adults
-        df_emp = df[df['employment'] == 'Employed'].groupby(group_col)[['individual_prediction_pums', 'PERWT']].sum().reset_index()
-        df_emp['Employed Adults (Survey)'] = df_emp['individual_prediction_pums'] / df_emp['PERWT']
-        df_emp['Demographic'] = df_emp[group_col]
-        if group_col == 'STATEFIP' and label_map:
-            df_emp['Demographic'] = df_emp['Demographic'].map(label_map)
-
-        # Employed 18–64
-        df_1864 = df[(df['employment'] == 'Employed') & (df['age'] != '>65')].groupby(group_col)[['individual_prediction_pums', 'PERWT']].sum().reset_index()
-        df_1864['Employed 18–64 (Survey)'] = df_1864['individual_prediction_pums'] / df_1864['PERWT']
-        df_1864['Demographic'] = df_1864[group_col]
-        if group_col == 'STATEFIP' and label_map:
-            df_1864['Demographic'] = df_1864['Demographic'].map(label_map)
-
-        # Merge all three
-        summary = df_adults[['Demographic', 'Adults (Survey)']].merge(
-            df_emp[['Demographic', 'Employed Adults (Survey)']],
-            on='Demographic', how='outer'
-        ).merge(
-            df_1864[['Demographic', 'Employed 18–64 (Survey)']],
-            on='Demographic', how='outer'
-        )
-
-        summaries.append(summary)
-
-    # ---------- Final merged summary ----------
-    final_summary = pd.concat(summaries, ignore_index=True)
-
-    return final_summary
 ###############################################################################
 def run_model_scenario(
     year,
@@ -901,10 +800,10 @@ def run_model_scenario(
     bases_df=pd.read_csv('Paid_Leave/Other_files/bases.csv')   
     bases=bases_df.set_index('Unnamed: 0')['Lowest Category'].to_dict()
     # Run model selection
-    log_reg, ideal_threshold,coef_df,summary_df = model_selection(model_id, bases, family_income_vs_education,save_line=save_line, race=race)
+    log_reg,pt_threshold,ft_threshold,coef_df,summary_df = model_selection(model_id, bases, family_income_vs_education,save_line=save_line, race=race)
     #return summary_df
     # Run model
-    model_outcome = model_run(year, log_reg, ideal_threshold, family_income_vs_education,save_line=save_line, race=race)
+    model_outcome = model_run(year, log_reg,pt_threshold,ft_threshold, family_income_vs_education,save_line=save_line, race=race)
 
     # Set prediction to 0 for non-working individuals
     #model_outcome.loc[model_outcome['employment']!='Employed', 'Prediction'] = 0
@@ -929,7 +828,7 @@ def run_model_scenario(
     
     mapping(df_map, column_name, county_column_name,family_income_vs_education, race=race,save_line=save_line)
     #mapping(df_map, 'proportions_18+', county_column_name,family_income_vs_education, race=race,save_line=save_line)
-    mapping(df_map, 'proportions_SAH', county_column_name,family_income_vs_education, race=race,save_line=save_line)
+    #mapping(df_map, 'proportions_SAH', county_column_name,family_income_vs_education, race=race,save_line=save_line)
     #mapping(df_map, 'proportions_18+_SAH', county_column_name,family_income_vs_education, race=race,save_line=save_line)
     
     
@@ -942,7 +841,7 @@ def run_model_scenario(
 ############################################################################################################################################################
 
 
-outcome_base, map_base, sums_base, merged_base,coef_df,summary_sex   = run_model_scenario(
+outcome_base, map_base, sums_base, merged_base,ft_coef,pt_coef   = run_model_scenario(
     year=2023,
     model_id='23',
     family_income_vs_education='education',
