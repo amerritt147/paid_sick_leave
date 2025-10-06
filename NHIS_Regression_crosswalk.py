@@ -15,6 +15,9 @@ import numpy as np
 import geopandas as gpd
 from sklearn.model_selection import train_test_split
 from sklearn import metrics
+import patsy
+from sklearn.preprocessing import StandardScaler
+import statsmodels.api as sm
 #from sklearn.utils import resample
 from sklearn.metrics import roc_auc_score
 import statsmodels.formula.api as smf
@@ -162,7 +165,7 @@ def model_selection(yr,bases,family_income_vs_education,race='no',save_line='bas
     
     
         # Define the list of predictor variables
-        feature_cols = ['sex','age',family_income_vs_education,'region','occupation'] #family_income_vs_education allows us easily switch between the two variables for sensitivity analysis
+        feature_cols = ['sex','age',family_income_vs_education,'region','occupation','emp_hins'] #family_income_vs_education allows us easily switch between the two variables for sensitivity analysis
         
         
         # Add race variable if specified
@@ -186,20 +189,61 @@ def model_selection(yr,bases,family_income_vs_education,race='no',save_line='bas
         formula = (
         'target ~ C(sex, Treatment(reference="' + bases['sex'] + '")) + '
         'C(region, Treatment(reference="' + bases['region'] + '")) + '
-        #'C(emp_hins, Treatment(reference="' + bases['emp_hins'] + '"))+'
+        'C(emp_hins, Treatment(reference="' + bases['emp_hins'] + '"))+'
         #'C(age, Treatment(reference="' + bases['age'] + '"))+'
         'poly(age, 2) + '
        # 'C(industry, Treatment(reference="' + bases['industry'] + '")) + '
         'C(occupation, Treatment(reference="' + bases['occupation'] + '")) + '
-        'C('+family_income_vs_education+', Treatment(reference="' + bases[family_income_vs_education] + '")) + 1')
+        'C('+family_income_vs_education+', Treatment(reference="' + bases[family_income_vs_education] + '"))  - 1')
         
         
         # Add race to the formula if applicable
         if race=='yes':
             formula=formula+' + C(race,Treatment(reference="'+ bases['race'] + '"))' 
         
+        
+        y_train_design, X_train_design = patsy.dmatrices(
+            formula,
+            data=X_train,
+            return_type='dataframe'
+        )
+        
+        # Save design_info for later reuse
+        design_info = X_train_design.design_info
+        
+        
+
+        stats_df = pd.DataFrame({
+        'mean': X_train_design.mean(),
+        'std': X_train_design.std()})
+
+        
+        
+        X_train_scaled= (X_train_design - stats_df['mean']) / stats_df['std']
+        
+        X_train_scaled['Intercept'] = 1
+        X_train_scaled['poly(age, 2)[0]']=1
+
+        
+        if leave =='Part-time':
+            pt_design=design_info
+            pt_stats=stats_df
+        else:
+            ft_design=design_info
+            ft_stats=stats_df
+        
+        
+        
+        
+        # --- 3. Fit model ---
+        model = sm.GLM(
+            y_train_design,
+            X_train_scaled,
+            family=sm.families.Binomial(),
+            freq_weights=w_train
+        ).fit()
         # # Fit logistic regression model using sampling weights
-        model = smf.glm(formula=formula,data=X_train,family=sm.families.Binomial(),freq_weights=w_train).fit()
+        #model = smf.glm(formula=formula,data=X_train,family=sm.families.Binomial(),freq_weights=w_train).fit()
         
         ########################### Plotting Coefficenients ##########################
            
@@ -346,14 +390,24 @@ def model_selection(yr,bases,family_income_vs_education,race='no',save_line='bas
         
         
         # Generate probability predictions for the positive class (class 1) on test data
+        X_test_design = patsy.build_design_matrices(
+            [design_info],
+            X_test,
+            return_type='dataframe'
+        )[0]
+        
+        # --- 5. Standardize test using same scaler ---
+        X_test_scaled= (X_test_design - stats_df['mean']) / stats_df['std']
+        
+        X_test_scaled['Intercept'] = 1
+        X_test_scaled['poly(age, 2)[0]']=1
+        # --- 6. Predict ---
+        y_probs = model.predict(X_test_scaled)
+        
         test_df = X_test.copy()
         test_df['target'] = y_test
-        
-        # Now use model.predict on test_df
-        y_probs = model.predict(test_df)
         test_df['predicted_prob'] = y_probs
-      
-        # Define threshold values from 0 to 1 with 0.001 step size
+                # Define threshold values from 0 to 1 with 0.001 step size
         thresholds=list(np.arange(0,1,0.0001))
         recall=[]
         specificity=[]
@@ -459,13 +513,13 @@ def model_selection(yr,bases,family_income_vs_education,race='no',save_line='bas
             part_time_model=model
             part_time_threshold=ideal_threshold
             pt_coef=coef_df
-    return full_time_model,full_time_threshold,part_time_model,part_time_threshold,ft_coef,pt_coef
+    return full_time_model,full_time_threshold,ft_design,part_time_model,part_time_threshold,pt_design,ft_coef,pt_coef,ft_stats,pt_stats
 
 ########################################################################################################################################################################################################
 ############################################################################################ Model Usage ###############################################################################################
 ########################################################################################################################################################################################################
 
-def model_run(year,full_time_model,full_time_threshold,part_time_model,part_time_threshold,family_income_vs_education,race='no',save_line='base_22'):
+def model_run(year,full_time_model,full_time_threshold,ft_design,part_time_model,part_time_threshold,pt_design,ft_stats,pt_stats,family_income_vs_education,race='no',save_line='base_22'):
 
     #Importing Census Data for those employed
     file_name = 'Paid_Leave/cleaned_data/IPUMS/ipums_employed_'+str(year)+'_cleaned.csv'
@@ -499,19 +553,48 @@ def model_run(year,full_time_model,full_time_threshold,part_time_model,part_time
         #Creating input for dataframe
         X_pt=ipums_pt[feature_cols]
         X_ft=ipums_ft[feature_cols]
-        
+
         X_pt=X_pt.dropna()
         X_ft=X_pt.dropna()
+        
+        puma_pt = X_pt[['PUMA','PERWT','STATEFIP']].copy()
+        puma_ft = X_ft[['PUMA','PERWT','STATEFIP']].copy()
+        
+        X_pt_design = patsy.build_design_matrices([pt_design], X_pt, return_type='dataframe')[0]
+        X_ft_design = patsy.build_design_matrices([ft_design], X_ft, return_type='dataframe')[0]
+    
     
 
-        results_pt=X_pt
-        results_ft=X_ft
+
+        results_pt=X_pt_design
+        results_ft=X_ft_design
         
+        results_pt[['PUMA','PERWT','STATEFIP']] = puma_pt.values
+        results_ft[['PUMA','PERWT','STATEFIP']] = puma_ft.values
+        
+        
+        
+        
+        X_pt_scaled= (X_pt_design - pt_stats['mean']) / pt_stats['std']
+        
+        X_pt_scaled['Intercept'] = 1
+        X_pt_scaled['poly(age, 2)[0]']=1
+        
+        X_ft_scaled= (X_ft_design - ft_stats['mean']) / ft_stats['std']
+        
+        X_ft_scaled['Intercept'] = 1
+        X_ft_scaled['poly(age, 2)[0]']=1
 
-        # Predict
+        
+        
+        X_ft_scaled = X_ft_scaled[full_time_model.model.exog_names]
+        ft_probs = full_time_model.predict(X_ft_scaled)
 
-        ft_probs=full_time_model.predict(X_ft)
-        pt_probs=part_time_model.predict(X_pt)
+        X_pt_scaled = X_pt_scaled[part_time_model.model.exog_names]
+        pt_probs = part_time_model.predict(X_pt_scaled)
+
+
+
         
         
 
@@ -534,7 +617,7 @@ def model_run(year,full_time_model,full_time_threshold,part_time_model,part_time
    
     final_df = pd.concat(all_results, ignore_index=True)
     
-    
+
     #Importing unemployed dataset 
     unemployed=pd.read_csv('Paid_Leave/cleaned_data/IPUMS/ipums_notemployed_'+str(year)+'_cleaned.csv')
     #All inemployed would not have paid leave, but would be safe at home 
@@ -545,7 +628,7 @@ def model_run(year,full_time_model,full_time_threshold,part_time_model,part_time
     final_df=pd.concat([final_df,unemployed], ignore_index=True)
     final_df['PUMA']= final_df['PUMA'].astype(str).str.zfill(5)
     final_df['STATEFIP']=final_df['STATEFIP'].astype(str).str.zfill(2)
-    print(final_df.groupby('PUMA')[['SAH','Prediction']].sum())
+
     final_df.to_csv('Paid_Leave/Regression_and_outputs/model_outcome_'+save_line+'.csv')
     return final_df
 
@@ -555,68 +638,88 @@ def model_run(year,full_time_model,full_time_threshold,part_time_model,part_time
 ########################################################################################################################################################################################################
 def puma_crosswalk(df, crosswalk, race='no', save_line='base_23'):
     df = df.copy()
+    df['PUMA']= df['PUMA'].astype(str).str.zfill(5)
+    df['STATEFIP']=df['STATEFIP'].astype(str).str.zfill(2)
     crosswalk = crosswalk.copy()
+    crosswalk['PUMA']= crosswalk['PUMA'].astype(str).str.zfill(5)
+    crosswalk['STATEFIP']=crosswalk['STATEFIP'].astype(str).str.zfill(2)
 
     outcomes = {}  # store results for each variable
 
-    for var in ["Prediction"]:
+    for var in ["Prediction", "SAH"]:
         # Weighted variable at person level
-        df["individual_Prediction_pums"] = df[var] * df["PERWT"]
-
+        df[f"individual_{var}_pums"] = df[var] * df["PERWT"]
+        
         # Aggregate to PUMA level
-        df_sums = (
-            df.groupby(["PUMA", "STATEFIP"])[["individual_Prediction_pums", "PERWT"]]
-            .sum()
-            .reset_index()
-        )
-        df_sums["individual_Prediction_prop"] = df_sums["individual_Prediction_pums"] / df_sums["PERWT"]
-
+        df_sums = df.groupby(["PUMA", "STATEFIP"])[[f"individual_{var}_pums", "PERWT"]].sum().reset_index()
+        df_sums[f"individual_{var}_prop"] = df_sums[f"individual_{var}_pums"] / df_sums["PERWT"]
+        
+        # Format keys for merging
+        crosswalk["PUMA"] = crosswalk["PUMA"].astype(float).astype(int).astype(str).str.zfill(5)
+        crosswalk["STATEFIP"] = crosswalk["STATEFIP"].astype(float).astype(int).astype(str).str.zfill(2)
+        df_sums["PUMA"] = df_sums["PUMA"].astype(float).astype(int).astype(str).str.zfill(5)
+        df_sums["STATEFIP"] = df_sums["STATEFIP"].astype(float).astype(int).astype(str).str.zfill(2)
+    
         # Merge with crosswalk
-        merged = pd.merge(crosswalk, df_sums, on=["PUMA", "STATEFIP"], how="left")
-
-        # Ensure numerics
-        for col in ["individual_Prediction_prop", "prop_county_in_puma", "pop20"]:
+        merged = pd.merge(crosswalk, df_sums, on=["PUMA", "STATEFIP"], how="outer")
+    
+        # Ensure numeric
+        for col in [f"individual_{var}_prop", "prop_county_in_puma", "pop20"]:
             merged[col] = pd.to_numeric(merged[col], errors="coerce")
-
+    
         # Scale to counties
-        merged["weighted_Prediction"] = merged["individual_Prediction_prop"] * merged["prop_county_in_puma"]
-        merged["PERWT_Prediction"] = merged["PERWT"] * merged["prop_county_in_puma"]
-
+        merged[f"weighted_{var}"] = merged[f"individual_{var}_prop"] * merged["prop_county_in_puma"]
+        merged[f"PERWT_{var}"] = merged["PERWT"] * merged["prop_county_in_puma"]
+    
         # Aggregate to county level
         df_outcomes = (
-            merged.groupby("county")[["weighted_Prediction", "PERWT_Prediction", "pop20", "prop_county_in_puma"]]
+            merged.groupby("county")[[f"weighted_{var}", f"PERWT_{var}", "pop20", "prop_county_in_puma"]]
             .sum()
             .reset_index()
         )
-
-        # Merge with county pops
+    
+        # Merge with county populations
         df_outcomes = df_outcomes.merge(county_pops, on="county", how="left")
-
-        # Final props & counts
-        df_outcomes["proportions_Prediction"] = df_outcomes["weighted_Prediction"] / df_outcomes["prop_county_in_puma"]
-        df_outcomes["counts_Prediction"] = df_outcomes["proportions_Prediction"] * df_outcomes["pop20"]
-
+    
+        # Final proportions & counts
+        df_outcomes[f"proportions_{var}"] = df_outcomes[f"weighted_{var}"] / df_outcomes["prop_county_in_puma"]
+        df_outcomes[f"counts_{var}"] = df_outcomes[f"proportions_{var}"] * df_outcomes["pop20"]
+    
         # Store results
         outcomes[var] = (df_outcomes, df_sums, merged)
-
-    # --- Add extra enrichments for Prediction only ---
-    df_outcomes_pred, df_sums_pred, merged_pred = outcomes["Prediction"]
-
-    df_outcomes_pred["State"] = (
-        df_outcomes_pred["county"].astype(str).str.zfill(5).str[:2].map(statefip_to_name)
+    
+    # --- Combine Prediction + SAH into one dataframe ---
+    df_outcomes_pred, _, _ = outcomes["Prediction"]
+    df_outcomes_sah, _, _ = outcomes["SAH"]
+    
+    # Merge them on county
+    df_outcomes_combined = df_outcomes_pred.merge(
+        df_outcomes_sah[["county", "proportions_SAH", "counts_SAH"]],
+        on="county",
+        how="outer"
     )
-    df_outcomes_pred["Census_Division"] = df_outcomes_pred["State"].map(state_to_division)
-
-    # --- SAH ---
+    
+    # Enrich with State + Division info
+    df_outcomes_combined["State"] = (
+        df_outcomes_combined["county"].astype(str).str.zfill(5).str[:2].map(statefip_to_name)
+    )
+    df_outcomes_combined["Census_Division"] = df_outcomes_combined["State"].map(state_to_division)
+    
+    # Rename to generic 'proportions' if you need one for mapping
+    # (keeping both versions available)
+    df_outcomes_combined.rename(
+        columns={"proportions_Prediction": "proportions_Prediction", 
+                 "proportions_SAH": "proportions_SAH"},
+        inplace=True
+    )
 
     # Merge them together
-    df_outcomes_combined = df_outcomes_pred
     df_outcomes_combined.rename(columns={'proportions_Prediction':'proportions'},inplace=True)
     # Save
     df_outcomes_combined.to_csv(
-        f"Paid_leave/Regression_and_outputs/Counties_outcomes_with_race_{save_line}.csv", index=False)
+        f"Paid_leave/Regression_and_outputs/Counties_outcomes_{save_line}.csv", index=False)
 
-    return df_outcomes_combined, df_sums_pred, merged_pred
+    return df_outcomes_combined, df_sums, merged
 
 def mapping(df, column_name, county_column_name,family_income_vs_education,race='yes',save_line='base_22'):
     # Load shapefile
@@ -649,7 +752,9 @@ def mapping(df, column_name, county_column_name,family_income_vs_education,race=
     
     # Filter to desired states
     highlight_states = states_gdf[states_gdf['NAME'].isin(states_of_interest)]  # or use FIPS: states_gdf[states_gdf['STATEFP'].isin(['51', '24', '37'])]
-    norm = mpl.colors.Normalize(vmin=0, vmax=1)
+    norm = mpl.colors.Normalize(
+    vmin=geo_df[column_name].min(),
+    vmax=geo_df[column_name].max())
     # Plot counties
     continental.plot(
         column=column_name,
@@ -667,8 +772,8 @@ def mapping(df, column_name, county_column_name,family_income_vs_education,race=
     
     
     sm = plt.cm.ScalarMappable(cmap='GnBu',norm=plt.Normalize(
-    vmin=0,
-    vmax=1))
+    vmin=geo_df[column_name].min(),
+    vmax=geo_df[column_name].max()))
     sm._A = []
     cbar = fig.colorbar(sm, cax=cax, orientation='horizontal')
     cbar.set_label("Proportion with Paid Leave", fontsize=12)
@@ -769,10 +874,10 @@ def run_model_scenario(
     bases_df=pd.read_csv('Paid_Leave/Other_files/bases.csv')   
     bases=bases_df.set_index('Unnamed: 0')['Lowest Category'].to_dict()
     # Run model selection
-    full_time_model,full_time_threshold,part_time_model,part_time_threshold,ft_coef,pt_coef = model_selection(model_id, bases, family_income_vs_education,save_line=save_line, race=race)
+    full_time_model,full_time_threshold,ft_design,part_time_model,part_time_threshold,pt_design,ft_coef,pt_coef,ft_stats,pt_stats = model_selection(model_id, bases, family_income_vs_education,save_line=save_line, race=race)
     #return summary_df
     # Run model
-    model_outcome = model_run(year,  full_time_model,full_time_threshold,part_time_model,part_time_threshold, family_income_vs_education,save_line=save_line, race=race)
+    model_outcome = model_run(year,full_time_model,full_time_threshold,ft_design,part_time_model,part_time_threshold,pt_design,ft_stats,pt_stats,family_income_vs_education,save_line=save_line, race=race)
 
     # Set prediction to 0 for non-working individuals
     #model_outcome.loc[model_outcome['employment']!='Employed', 'Prediction'] = 0
@@ -797,7 +902,7 @@ def run_model_scenario(
     
     mapping(df_map, column_name, county_column_name,family_income_vs_education, race=race,save_line=save_line)
     #mapping(df_map, 'proportions_18+', county_column_name,family_income_vs_education, race=race,save_line=save_line)
-    #mapping(df_map, 'proportions_SAH', county_column_name,family_income_vs_education, race=race,save_line=save_line)
+    mapping(df_map, 'proportions_SAH', county_column_name,family_income_vs_education, race=race,save_line=save_line)
     #mapping(df_map, 'proportions_18+_SAH', county_column_name,family_income_vs_education, race=race,save_line=save_line)
     
     
@@ -821,14 +926,16 @@ outcome_base, map_base, sums_base, merged_base,ft_coef,pt_coef   = run_model_sce
     county_column_name=county_column_name,save_line='base_23'
 )
 
-# outcome_race, demos_race, map_race, sums_race, merged_race,coef_df  = run_model_scenario
+# outcome_race, demos_race, map_race, sums_race, merged_race,coef_df  = run_model_scenario(
+#     year=2023,
 #     model_id='23',
 #     family_income_vs_education='education',
 #     new_base='high school diploma, GED or equivalent',
 #     race=True,
 #     crosswalk=crosswalk,
 #     column_name=column_name,
-#     county_column_name=county_column_name)
+#     county_column_name=county_column_name,save_line='base_23'
+# )
 
 # outcome_income, demos_income, map_income, sums_income, merged_income = run_model_scenario(
 #     year=2022,
